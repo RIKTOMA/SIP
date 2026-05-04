@@ -250,7 +250,7 @@ def AlgBF(x0,Y0,fcp,gcp,g,X,Y,concave=False,drop_cuts=False):
     print("Time lower problem",Lower_prob_time)
     print("Feasibility", phi)
     print("Optimal value", fk)
-    print("Value function call", j)
+    print("Value function call", j+1)
     
     return xk,fk,tempo_esecuzione,phi,j
 
@@ -308,8 +308,8 @@ def AlgMePa(x0,Y0,fcp,gcp,g,X,Y,Ub=10000,concave=False,drop_cuts=False):
     print("Feasibility", phi)
     print("Optimal value", fk[0])
     print("Optimality cuts", optimal_cuts)
-    print("Feasibility cuts", i-optimal_cuts)
-    print("Value function calls", i)
+    print("Feasibility cuts", i+1-optimal_cuts)
+    print("Value function calls", i+1)
     
     return  xk,fk[0],tempo_esecuzione,phi,i,optimal_cuts,i-optimal_cuts
 
