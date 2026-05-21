@@ -5,9 +5,12 @@ import random
 import cvxpy as cp
 from scipy.optimize import direct
 import warnings
+from scipy.integrate import quad
+
+
 warnings.filterwarnings('ignore', category=UserWarning)
 
-solver="MOSEK"
+solver="SCS"
 
 
 def linear(x,param):
@@ -160,11 +163,11 @@ def prox(xk,hk,gammak,X):
     for i in range(len(X)):
         u=X[i]
         cons_x=cons_x+[x[i]>=u[0]]+[x[i]<=u[1]]
-    prob = cp.Problem(cp.Minimize(gammak*x.T@hk+1/2*cp.sum_squares(x-xk)),cons_x)
+    prob = cp.Problem(cp.Minimize(1/2*cp.sum_squares(x-xk)),cons_x)
     prob.solve(solver)
     return x.value
 
-def proximal_step(xk,h,gamma,X,hc=False):
+def proximal_step(xk,h,gamma,X,hc=False,gc=False,rho=0):
     n=np.size(xk)
     x = cp.Variable(n)
     cons_x=[]
@@ -174,21 +177,27 @@ def proximal_step(xk,h,gamma,X,hc=False):
         cons_x=cons_x+[gi(x,param_gi)<=0]
     if hc:
         cons_x+=[hc(x)<=0]
-    prob = cp.Problem(cp.Minimize(h(x)+1/(2*gamma)*cp.sum_squares(x-xk)),cons_x)
+    if gc:
+        eta=cp.Variable(1)
+        cons_eta=[eta>=0]
+        cons_eta+=[gc(x)<=eta]
+        prob = cp.Problem(cp.Minimize(h(x)+rho*eta+1/(2*gamma)*cp.sum_squares(x-xk)),cons_x+cons_eta)
+    else:
+        prob = cp.Problem(cp.Minimize(h(x)+1/(2*gamma)*cp.sum_squares(x-xk)),cons_x)
     prob.solve(solver)
     return prob.value,x.value
 
-def proximal_solver(xi,h,gamma,X,hc=False,tol=10**-3):
+def proximal_solver(xi,h,gamma,X,hc=False,gc=False,rho=0,tol=10**-3):
     start=time.time()
-    for i in range(1000):
+    for i in range(1):
         xold=xi
-        fi,xi=proximal_step(xi,h,gamma,X,hc)
+        fi,xi=proximal_step(xi,h,gamma,X,hc,gc,rho)
         #print(np.linalg.norm(xold-xi,2))
         if np.linalg.norm(xold-xi,2)<=tol:
             end=time.time()
-            print("Number of iter",i+1)
-            print("Total time",end-start)
-            print("Time per iteration",(end-start)/(i+1))
+            #print("Number of iter",i+1)
+            #print("Total time",end-start)
+            #print("Time per iteration",(end-start)/(i+1))
             break
     return fi,xi
 
@@ -208,48 +217,50 @@ def projection_step(xk,fk,v,gamma,X,hc=False):
 
 def projection_solver(xi,gamma,X,Yk,g,dg,f,df,rho=1,hc=False,tol=10**-3):
     start=time.time()
-    for i in range(10000):
+    fopt=100000
+    for i in range(100):
         ymax=Yk[np.argmax([g(xi,yk) for yk in Yk])]
+        #print(np.sum([ g(xi,yk) > g(xi,ymax)-10**-3 for yk in Yk]))
         if g(xi,ymax)>0:
             v=df(xi)+rho*dg(xi,ymax)
             fi=f(xi)+rho*g(xi,ymax)
         else:
             v=df(xi)
             fi=f(xi)
-        #print(fi)
-        #print(g(xi,ymax))
         xold=xi
         xi=xold-gamma/(i+1)*v
-        
-        #fi,xi=projection_step(xi,fi,v,gamma/(i+1),X,hc)
-        #print(fi,f(xi))
-        #print(np.linalg.norm(xold-xi,2))
-        #print(np.linalg.norm(xold-xi,2))
-        print(np.linalg.norm(v,2))
+        if fi<fopt:
+            #print(fi)
+            fopt=fi
+            xopt=xi
+        for j in range(len(X)):
+            #print(xi)
+            #print(j)
+            xi[j]=np.min([np.max([xi[j],X[j][0]]),X[j][1]])
         if np.linalg.norm(xold-xi,2)<=tol:
+            #print(np.linalg.norm(v,2))
             end=time.time()
-            #print(np.linalg.norm(xold-xi,2))
-            print("Number of iter",i+1)
-            print("Total time",end-start)
-            print("Time per iteration",(end-start)/(i+1))
-            break
+            #print("Number of iter",i+1)
+            #print("Total time",end-start)
+            #print("Time per iteration",(end-start)/(i+1))
+            #break
         
-    return f(xi),xi
+    return  fopt,xopt
     
 def AlgPenDisc(x0,Y0,fcp,gcp,g,X,Y,rho=1,concave=False,gcps=[],drop_cuts=False,f=False,df=False,dg=False):
     proximal=False
-    projection=True
+    projection=False
+    solver=True
     tol=10**-3
     n=np.size(x0)
     xk=x0
+    xc=x0
     Yk=Y0
-    fk=f(xk)+rho*g(xk,Y0[0])
-    print(fk)
     J=[i for i in range(len(Y0))]
     Jk=J
     xold=x0
     sigma=2
-    gamma=1
+    gamma=1/10
     while_loops=100
     rho_inc=0
     inizio=time.time()
@@ -258,20 +269,36 @@ def AlgPenDisc(x0,Y0,fcp,gcp,g,X,Y,rho=1,concave=False,gcps=[],drop_cuts=False,f
     Lower_prob_time=0
     cuts=len(J)-1
     initialcuts=cuts
+    M=10000
+    deltak=1
+    tau=0.99
+    k=1
     for j in range(while_loops):
         timeUP=time.time()
         #print(Yk)
-        #fk,xk,vfk=compute_min_disc(xk,fcp,gcp,X,Yk,rho,J)
+        xold=xk
+        if solver:
+            fk,xk,vfk=compute_min_disc(xk,fcp,gcp,X,Yk,rho,J)
         if proximal:
             def h(x):
                 return fcp(x)+rho*cp.pos(cp.max(cp.hstack([gcp(x,yi) for yi in Yk ])))
-            fk,xk=proximal_solver(xk,h,gamma,X)
+            def gc(x):
+                return cp.max(cp.hstack([gcp(x,yi) for yi in Yk ]))
+            def fzero(x):
+                return 0
+            fk,xk=proximal_solver(xc-gamma*df(xc),fzero,gamma,X,gc=gc,rho=rho)
+            fk=f(xk)
+            #print(np.linalg.norm(xk-xold,2))
         if projection:
+            def freg(x):
+                return f(x)+0.5*(x-xk).T@(x-xk)
+            def dfreg(x):
+                return  df(x)+(x-xk)
             fk,xk=projection_solver(xk,gamma,X,Yk,g,dg,f,df,rho=rho)
         vfk=np.max([g(xk,yk) for yk in Yk])
         Upper_prob_time+=time.time()-timeUP
         if vfk>tol:
-            print(rho)
+            #print(rho)
             rho_inc=rho_inc+1
             rho=sigma*rho
         else:
@@ -282,8 +309,15 @@ def AlgPenDisc(x0,Y0,fcp,gcp,g,X,Y,rho=1,concave=False,gcps=[],drop_cuts=False,f
             else:
                 phi,yphi=vf_maximum_concave(xk,Yk[-1],gcps,Y)
             Lower_prob_time+=time.time()-TimeLP
+            if phi-vfk<=deltak:
+                #print(np.linalg.norm(xk-xc,2))
+                xc=xk
+                k+=1
+                deltak=deltak*tau
+            print(phi-vfk)
             if phi<=tol:
                 break
+                #pass
             else:
                     cuts+=1
                     Yk=np.append(Yk,[yphi],axis=0)
@@ -293,6 +327,83 @@ def AlgPenDisc(x0,Y0,fcp,gcp,g,X,Y,rho=1,concave=False,gcps=[],drop_cuts=False,f
                         J=np.array(J)[mask.flat]
                     else:
                         pass
+    fine=time.time()
+    tempo_esecuzione=fine-inizio
+    print("Time", tempo_esecuzione)
+    print("Time upper problem",Upper_prob_time)
+    print("Time lower problem",Lower_prob_time)
+    print("Feasibility", phi)
+    print("Final rho", rho)
+    print("Rho increases",rho_inc)
+    print("Optimal value", fk)
+    print("Value function call", chiamate_vf)
+    
+    return xk,fk,tempo_esecuzione,phi,j,rho_inc
+
+def AlgProxPen(x0,Y0,fcp,gcp,g,X,Y,rho=1,concave=False,gcps=[],drop_cuts=False,f=False,df=False,dg=False,tol=10**-3):
+    n=np.size(x0)
+    xk=x0
+    xc=x0
+    Yk=Y0
+    J=[i for i in range(len(Y0))]
+    Jk=J
+    xold=x0
+    sigma=2
+    gamma=1/100
+    while_loops=100
+    rho_inc=0
+    inizio=time.time()
+    chiamate_vf=0
+    Upper_prob_time=0
+    Lower_prob_time=0
+    cuts=len(J)-1
+    initialcuts=cuts
+    M=0.1
+    deltak=M
+    tau=0.9
+    for j in range(while_loops):
+        Wk= Yk
+        for i in range(while_loops):
+            
+            timeUP=time.time()
+            def h(x):
+                return fcp(x)+rho*cp.pos(cp.max(cp.hstack([gcp(x,yi) for yi in Yk ])))
+            def gc(x):
+                return rho*cp.pos(cp.max(cp.hstack([gcp(x,yi) for yi in Wk ])))
+                
+            fk,xk=proximal_solver(xc-gamma*df(xc),gc,gamma,X,gc=False,rho=rho)
+
+            fk=f(xk)
+            ymax=Wk[np.argmax([g(xk,yk) for yk in Wk])]
+            vfk=g(xk,ymax)
+            Upper_prob_time+=time.time()-timeUP
+            chiamate_vf+=1
+            TimeLP=time.time()
+            if concave==False:
+                phi,yphi=vf(xk,g,Y)
+            else:
+                phi,yphi=vf_maximum_concave(xk,Yk[-1],gcps,Y)
+            
+            Lower_prob_time+=time.time()-TimeLP
+            Wk=np.append(Wk,[yphi],axis=0) 
+            #Yk=np.append(Yk,[yphi],axis=0) 
+            
+            if phi-vfk<=deltak:
+                xc=xk
+                deltak=deltak*tau
+                if phi>tol:
+                    Yk=np.append(Yk,[yphi],axis=0)
+                if i>0:
+                    Yk=np.append(Yk,[ymax],axis=0)
+                break
+              
+        if vfk>tol:
+            rho_inc=rho_inc+1
+            rho=sigma*rho
+        else:
+            print(np.linalg.norm(xc-xk,2)/gamma)
+            if np.linalg.norm(xc-xk,2)<=10**-12 and phi<=tol:
+                break
     fine=time.time()
     tempo_esecuzione=fine-inizio
     print("Time", tempo_esecuzione)
@@ -327,7 +438,8 @@ def AlgBF(x0,Y0,fcp,gcp,g,X,Y,concave=False,gcps=[],drop_cuts=False):
             return fcp(x)
         def hc(x):
             return cp.max(cp.hstack([gcp(x,yi) for yi in Yk ]))
-        fk,xk=proximal_solver(xk,h,gamma,X,hc)
+        fk,xk=compute_bf(xk,fcp,gcp,X,Yk,J)
+        #fk,xk=proximal_solver(xk,h,gamma,X,hc)
         Upper_prob_time+=time.time()-timeUP
         TimeLP=time.time()
         if concave==False:
@@ -392,6 +504,7 @@ def AlgMePa(x0,Y0,fcp,gcp,g,X,Y,Ub=10000,concave=False,gcps=[],drop_cuts=False):
         Lower_prob_time+=time.time()-TimeLP
         if phi>tol:
             Yk=np.append(Yk,[yphi],axis=0)
+            print(yphi)
             s=np.append(s,[sj],axis=0)
             J=np.append(J,J[-1]+1)
         else:
@@ -417,6 +530,7 @@ def AlgMePa(x0,Y0,fcp,gcp,g,X,Y,Ub=10000,concave=False,gcps=[],drop_cuts=False):
     return  xk,fk[0],tempo_esecuzione,phi,i,optimal_cuts,i-optimal_cuts
 
 def AlgRemez(x0,Y0,fcp,gcp,g,X,Y,concave=False):
+    tol=10**-3
     def thetacp(x):
         return 1/2*cp.maximum(x,0)**2
    
@@ -441,8 +555,11 @@ def AlgRemez(x0,Y0,fcp,gcp,g,X,Y,concave=False):
         def regphicp(x):
             return cp.norm(x-xk,2)**2
         xold=xk
-        fk,xk,vfk=compute_min_remez(xk,fcp,gcp,thetacp,regphicp,X,Yk,epsk,deltak,gammak)
-        
+        def gc(x):
+            return fcp(x)+gammak/np.size(Yk)*cp.sum(cp.hstack([thetacp(gcp(x,yi)*deltak)/deltak for yi in Yk ]))
+        fk,xk=proximal_solver(xk,gc,1,X)
+        ymax=Yk[np.argmax([g(xk,yk) for yk in Yk])]
+        vfk=g(xk,ymax)
         Upper_prob_time+=time.time()-timeUP
         TimeLP=time.time()
         if concave==False:
@@ -450,7 +567,8 @@ def AlgRemez(x0,Y0,fcp,gcp,g,X,Y,concave=False):
         else:
             phi,yphi=vf_concave(xk,yk,gcp,Y)
         Lower_prob_time+=time.time()-TimeLP
-        if np.linalg.norm(xold-xk)<=10**-6:
+        #print(np.linalg.norm(xk-xold,2),phi)
+        if np.linalg.norm(xk-xold,2)<=tol and phi<=tol:
             break
         else:
             Yk=np.append(Yk,[yphi],axis=0)
@@ -513,3 +631,100 @@ def AlgCoM(x0,y0,fcp,gcp,g,df,dg,X,Y,concave=False):
     print("Value function call", j)
     
     return xk,fk,tempo_esecuzione,phi,j
+
+def AlgYe(x0,Y0,fcp,gcp,f,g,df,dg,X,Y,concave=False):
+    alpha=0.3
+    beta=0.3
+    sigma1=10**-6
+    sigma2=10**-6
+    sigma=1.1
+    sigmaa=1.1
+    eta=10**6
+    tol=10**-3
+    rho=10**-6
+    lambd=1
+    gamma=10**-6
+    n=np.size(x0)
+    xk=x0
+    Yk=Y0
+    xold=x0
+    epsk=1
+    deltak=1
+    gammak=1
+    
+    while_loops=1000
+    inizio=time.time()
+    chiamate_vf=0
+    Upper_prob_time=0
+    Lower_prob_time=0
+
+    for k in range(while_loops):  
+        xold=xk
+        zs=xk
+        for s in range(while_loops):
+            def gint(y,x,rho):
+                return np.exp(rho*g(x,y))
+            def dgint(y,x,rho,i):
+                return np.exp(rho*g(x,y))*dg(x,y)[i]
+            def gammarho(x):
+                I=quad(gint,Y[0][0],Y[0][1],(x,rho))
+                return np.log(I[0])/rho
+            def dgammarho(x):
+                n=np.size(x0)
+                I=np.zeros(n)
+                for i in range(n):
+                    I[i]=quad(dgint,Y[0][0],Y[0][1],(x,rho,i))[0]/(quad(gint,Y[0][0],Y[0][1],(x,rho))[0]+10**-3)
+                return I
+            def Glamrho(x):
+                gammar=gammarho(x)
+                return f(x)+lambd/2*(np.sqrt(gammar**2+1/rho)+gammar)
+            def dGlamrho(x):
+                gammar=gammarho(x)
+                dgammar=dgammarho(x)
+                return df(x)+lambd/2*(gammar/np.sqrt(gammar**2+1/rho)+1)*dgammar
+            zold=zs
+            zsold=zs
+            j=0
+            gvalue=Glamrho(zs)
+            gradient=dGlamrho(zs)
+            gvalueold=10000
+            while True:
+                znew=prox(zs-beta**j*gradient,0,0,X)
+                gvaluenew=Glamrho(znew)
+                if gvaluenew-gvalue<=sigma1*gradient.T@(znew-zs) and beta**j>=gamma:
+                    alpha=beta**j
+                    break
+                if gvalueold-gvalue>=sigma2*gradient.T@(zsold-zs) and beta**j<=gamma:
+                    znew=prox(zs-beta**(j)*gradient,0,0,X)
+                    alpha=beta**(j)
+                    break
+                j+=1
+                zsold=znew
+                gvalueold=gvaluenew
+            phi,yphi=vf(xk,g,Y)
+            if np.linalg.norm(znew-zs)<=alpha*eta/(rho):
+                fk=f(znew)
+                xk=znew
+                gammar=gammarho(xk)
+                rho=sigma*rho
+                break
+        #print(gammar)
+        phi,yphi=vf(xk,g,Y)
+        #print(phi)
+        if gammar<=0:
+            #print(xk)
+            if np.linalg.norm(xold-xk,2)<=tol:
+                 break
+        else:        
+            lambd=sigmaa*lambd   
+    if concave==False:
+            phi,yphi=vf(xk,g,Y)
+    else:
+            phi,yphi=vf_concave(xk,Y0[0],gcp,Y)    
+    tempo_esecuzione=    time.time()-inizio
+    print("Time",tempo_esecuzione)
+    print("Feasibility", phi)
+    print("Optimal value", fk)
+    print("Cicli esterni",k+1)
+    
+    return xk,fk,tempo_esecuzione,phi,k
