@@ -592,7 +592,7 @@ def AlgRemez(x0,Y0,fcp,gcp,g,X,Y,concave=False,gcps=False):
 
 
 
-def AlgSPG(x0,Y0,fcp,gcp,f,g,df,dg,X,Y,concave=False,tol=10**-3):
+def AlgSGD(x0,Y0,fcp,gcp,f,g,df,dg,X,Y,concave=False,tol=10**-3):
     alpha=0.8
     beta=0.8
     sigma1=10**-3
